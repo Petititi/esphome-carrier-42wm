@@ -1,0 +1,46 @@
+# Carrier 42WM - production firmware (Home Assistant).
+#
+# Entities:
+#   - "Fan coil" (climate): off / auto / fan only / heat / cool, 10-30 degC in
+#     1 degC steps, fan auto / low / medium / high, swing. Current temperature
+#     is the T1 probe. One IR frame is sent per change made in Home Assistant;
+#     every frame from the original remote updates the entity.
+#   - T1 return air, T3 water, red and green front-panel LEDs.
+#
+#   esphome run carrier-42wm.yaml
+
+packages:
+  common: !include common.yaml
+
+external_components:
+  - source:
+      type: local
+      path: components
+    components: [carrier_ac84]
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret carrier_encryption_key
+
+remote_receiver:
+  id: ir_rx
+  pin:
+    number: GPIO33       # through the 4050 buffer
+    inverted: true       # the IR receiver pulls the line low during a mark
+  tolerance: 25%
+  filter: 50us
+  idle: 25ms
+  buffer_size: 10kb
+
+climate:
+  - platform: carrier_ac84
+    name: "Fan coil"
+    transmitter_id: ir_tx
+    receiver_id: ir_rx
+    sensor: t1_air
+    time_id: sntp_time
+    supports_cool: true
+    supports_heat: true

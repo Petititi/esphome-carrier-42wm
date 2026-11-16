@@ -1,0 +1,175 @@
+# Carrier 42WM - shared part (not compiled on its own).
+#
+# Included by both firmwares:
+#   carrier-42wm.yaml           production: Home Assistant climate entity
+#   carrier-42wm-learning.yaml  protocol exploration: web page + logs
+# Both use the same device name and OTA password, so you can switch from one
+# to the other with a plain OTA flash.
+#
+# Wiring: docs/hardware.md - IR protocol: docs/ir-protocol.md
+
+substitutions:
+  # Probe divider on the appliance board: NTC on the 5 V side, fixed resistor
+  # on the 0 V side, voltage read in between:
+  #   5 V --NTC--o--R_pd-- 0 V    =>   R_ntc = R_pd * (V5 - V) / V
+  r_pd_t1: "10000.0"   # fixed resistor of the T1 input (measured ~10.2 k)
+  r_pd_t3: "5600.0"    # fixed resistor of the T3 input (measured ~5.7 k)
+  # ~12 k at 21 degC on both probes => most likely NTC 10k B3950.
+  ntc_r25: "10kOhm"
+  ntc_beta: "3950"
+  # Probe voltages and resistances: hidden in production, shown while learning.
+  diag_internal: "true"
+
+esphome:
+  name: carrier-42wm
+  friendly_name: Carrier 42WM
+
+esp32:
+  board: az-delivery-devkit-v4
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_BT_ENABLED: n
+
+logger:
+  level: DEBUG
+
+ota:
+  - platform: esphome
+    password: !secret carrier_ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "Carrier-42WM Fallback"
+    password: !secret ap_password
+
+captive_portal:
+
+# The remote sends its clock in every frame; so do we.
+time:
+  - platform: sntp
+    id: sntp_time
+    timezone: Europe/Paris
+
+# ADS1115 (DFRobot DFR0553). The module pulls SDA/SCL up to its own 3.3 V,
+# so no level shifter is needed.
+i2c:
+  sda: GPIO27
+  scl: GPIO22
+  scan: true          # 0x48 expected in the boot log
+  frequency: 100kHz
+
+ads1115:
+  - address: 0x48
+
+sensor:
+  # Raw voltages. Gain 6.144 is needed to read up to 5 V.
+  # One reading every 10 s; temperatures publish a 1-minute average.
+  - platform: ads1115
+    id: v_t1
+    name: "T1 voltage"
+    multiplexer: A0_GND
+    gain: 6.144
+    update_interval: 10s
+    accuracy_decimals: 4
+    entity_category: diagnostic
+    internal: ${diag_internal}
+
+  - platform: ads1115
+    id: v_t3
+    name: "T3 voltage"
+    multiplexer: A1_GND
+    gain: 6.144
+    update_interval: 10s
+    accuracy_decimals: 4
+    entity_category: diagnostic
+    internal: ${diag_internal}
+
+  # Board 5 V, taken on the unused T2 probe input: top of the NTC dividers.
+  - platform: ads1115
+    id: v_5v
+    name: "Board 5V"
+    multiplexer: A2_GND
+    gain: 6.144
+    update_interval: 10s
+    accuracy_decimals: 3
+    entity_category: diagnostic
+    internal: ${diag_internal}
+
+  # Ratiometric NTC resistance. V close to V5 = shorted probe, V close to 0 =
+  # missing probe: both return NaN.
+  - platform: template
+    id: r_t1
+    name: "T1 resistance"
+    unit_of_measurement: "Ω"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    internal: ${diag_internal}
+    lambda: |-
+      const float v = id(v_t1).state, v5 = id(v_5v).state;
+      if (isnan(v) || isnan(v5) || v <= 0.01f || v >= v5 - 0.01f) return NAN;
+      return ${r_pd_t1} * (v5 - v) / v;
+
+  - platform: template
+    id: r_t3
+    name: "T3 resistance"
+    unit_of_measurement: "Ω"
+    accuracy_decimals: 0
+    update_interval: 10s
+    entity_category: diagnostic
+    internal: ${diag_internal}
+    lambda: |-
+      const float v = id(v_t3).state, v5 = id(v_5v).state;
+      if (isnan(v) || isnan(v5) || v <= 0.01f || v >= v5 - 0.01f) return NAN;
+      return ${r_pd_t3} * (v5 - v) / v;
+
+  - platform: ntc
+    id: t1_air
+    sensor: r_t1
+    name: "T1 return air"
+    calibration:
+      b_constant: ${ntc_beta}
+      reference_temperature: 25°C
+      reference_resistance: ${ntc_r25}
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 6
+
+  - platform: ntc
+    sensor: r_t3
+    name: "T3 water"
+    calibration:
+      b_constant: ${ntc_beta}
+      reference_temperature: 25°C
+      reference_resistance: ${ntc_r25}
+    filters:
+      - sliding_window_moving_average:
+          window_size: 6
+          send_every: 6
+
+  # Red LED as a duty cycle: the appliance sometimes dims it with PWM.
+  - platform: duty_cycle
+    pin: GPIO35          # through the 4050 buffer; input-only pin
+    name: "Red LED"
+    update_interval: 5s
+    filters:
+      - delta: 5.0
+
+binary_sensor:
+  - platform: gpio
+    pin: GPIO39          # through the 4050 buffer; input-only pin
+    name: "Green LED"
+    filters:
+      - delayed_off: 50ms
+
+# Wired IR output: GPIO high => transistor pulls the IR line to 0 V (a "mark").
+# Our own frames are read back by the receiver ~0.2 s later.
+remote_transmitter:
+  id: ir_tx
+  pin: GPIO26
+  carrier_duty_percent: 100%   # no 38 kHz carrier: this is a wire, not an LED
+  non_blocking: true

@@ -1,0 +1,199 @@
+# Carrier 42WM - learning firmware (protocol exploration, no Home Assistant).
+#
+# Web page on the ESP32: http://carrier-42wm.local (state, capture note, live logs).
+#
+# Listening: type what you are about to do on the remote in "Capture note"
+# (e.g. "cool mode"), press the button, then read "Decoded fields" or the
+# CAPTURE;... log lines. Change one setting at a time. The last 400 captures
+# are kept in RAM ("Dump capture log" replays them).
+#
+# Sending: only through the "TX test" buttons, and only while "IR transmit
+# enabled" is on (off at boot, turns itself off after 10 minutes). Every frame
+# sent is logged (TX;...).
+#
+#   esphome run carrier-42wm-learning.yaml
+
+substitutions:
+  diag_internal: "false"   # show probe voltages and resistances
+
+packages:
+  common: !include common.yaml
+  tools: !include learning-tools.yaml
+
+esphome:
+  includes:
+    - components/carrier_ac84/carrier_ac84.h
+
+# API kept for `esphome logs` over Wi-Fi. Without Home Assistant the default
+# reboot-when-no-client must be disabled.
+api:
+  reboot_timeout: 0s
+  encryption:
+    key: !secret carrier_encryption_key
+
+# Local web page (assets embedded: works without Internet access).
+web_server:
+  port: 80
+  version: 3
+  local: true
+  log: true
+
+# --- Transmit tests (web page) ------------------------------------------------
+# Suggested order: 1) resend the last frame received (nothing should change
+# but a beep), 2) off, 3) on, then setpoint, fan speed and swing.
+# The starting state is the last frame received from the real remote.
+button:
+  - platform: template
+    name: "TX test 1: resend last received frame"
+    icon: mdi:repeat
+    on_press:
+      - script.execute: send_ac
+  - platform: template
+    name: "TX test 2: power off"
+    icon: mdi:power-off
+    on_press:
+      - lambda: "carrier84::set_power(id(ac_state).data(), false);"
+      - script.execute: send_ac
+  - platform: template
+    name: "TX test 3: power on"
+    icon: mdi:power
+    on_press:
+      - lambda: "carrier84::set_power(id(ac_state).data(), true);"
+      - script.execute: send_ac
+  - platform: template
+    name: "TX test 4: setpoint +1 °C"
+    icon: mdi:thermometer-plus
+    on_press:
+      - lambda: |-
+          auto *s = id(ac_state).data();
+          const int t = carrier84::get_temp(s);
+          if (t >= 10 && t < 30) carrier84::set_temp(s, t + 1);
+      - script.execute: send_ac
+  - platform: template
+    name: "TX test 5: setpoint -1 °C"
+    icon: mdi:thermometer-minus
+    on_press:
+      - lambda: |-
+          auto *s = id(ac_state).data();
+          const int t = carrier84::get_temp(s);
+          if (t > 10 && t <= 30) carrier84::set_temp(s, t - 1);
+      - script.execute: send_ac
+  # Fan speeds 1 to 3. From auto (0), + goes to speed 1 and - does nothing.
+  - platform: template
+    name: "TX test 6: fan speed +"
+    icon: mdi:fan-plus
+    on_press:
+      - lambda: |-
+          auto *s = id(ac_state).data();
+          const uint8_t f = carrier84::get_fan(s);
+          if (f < 3) carrier84::set_fan(s, f + 1);
+      - script.execute: send_ac
+  - platform: template
+    name: "TX test 7: fan speed -"
+    icon: mdi:fan-minus
+    on_press:
+      - lambda: |-
+          auto *s = id(ac_state).data();
+          const uint8_t f = carrier84::get_fan(s);
+          if (f > 1 && f <= 3) carrier84::set_fan(s, f - 1);
+      - script.execute: send_ac
+
+switch:
+  # Swing (byte 2 bit 2). Also follows the real remote.
+  - platform: template
+    id: swing
+    name: "TX test 8: swing"
+    icon: mdi:arrow-oscillating
+    optimistic: true
+    restore_mode: DISABLED
+    turn_on_action:
+      - lambda: "carrier84::set_swing(id(ac_state).data(), true);"
+      - script.execute: send_ac
+    turn_off_action:
+      - lambda: "carrier84::set_swing(id(ac_state).data(), false);"
+      - script.execute: send_ac
+
+  # --- Bit tests ---------------------------------------------------------------
+  # Each switch flips ONE bit that never changes in captures, in every frame
+  # sent afterwards. It sends nothing by itself: pick a bit, then send a normal
+  # command and watch the appliance. Used to look for a "silent" (no beep) bit;
+  # none was found, see docs/ir-protocol.md.
+  - platform: template
+    name: "Bit test b2.0 (usually 1, sent 0)"
+    icon: mdi:numeric-0-box-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: "id(test_bits) |= 1;"
+      - logger.log: {level: WARN, tag: carrier, format: "Bit test b2.0 (byte 2 bit 0) flipped in the next frames."}
+    turn_off_action:
+      - lambda: "id(test_bits) &= (uint8_t) ~1;"
+      - logger.log: {level: INFO, tag: carrier, format: "Bit test b2.0 back to its usual value."}
+  - platform: template
+    name: "Bit test b2.1 (usually 1, sent 0)"
+    icon: mdi:numeric-1-box-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: "id(test_bits) |= 2;"
+      - logger.log: {level: WARN, tag: carrier, format: "Bit test b2.1 (byte 2 bit 1) flipped in the next frames."}
+    turn_off_action:
+      - lambda: "id(test_bits) &= (uint8_t) ~2;"
+      - logger.log: {level: INFO, tag: carrier, format: "Bit test b2.1 back to its usual value."}
+  - platform: template
+    name: "Bit test b3.4 (usually 1, sent 0)"
+    icon: mdi:numeric-2-box-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: "id(test_bits) |= 4;"
+      - logger.log: {level: WARN, tag: carrier, format: "Bit test b3.4 (byte 3 bit 4) flipped in the next frames."}
+    turn_off_action:
+      - lambda: "id(test_bits) &= (uint8_t) ~4;"
+      - logger.log: {level: INFO, tag: carrier, format: "Bit test b3.4 back to its usual value."}
+  - platform: template
+    name: "Bit test b3.5 (usually 1, sent 0)"
+    icon: mdi:numeric-3-box-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: "id(test_bits) |= 8;"
+      - logger.log: {level: WARN, tag: carrier, format: "Bit test b3.5 (byte 3 bit 5) flipped in the next frames."}
+    turn_off_action:
+      - lambda: "id(test_bits) &= (uint8_t) ~8;"
+      - logger.log: {level: INFO, tag: carrier, format: "Bit test b3.5 back to its usual value."}
+  - platform: template
+    name: "Bit test b3.6 (usually 0, sent 1)"
+    icon: mdi:numeric-4-box-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: "id(test_bits) |= 16;"
+      - logger.log: {level: WARN, tag: carrier, format: "Bit test b3.6 (byte 3 bit 6) flipped in the next frames."}
+    turn_off_action:
+      - lambda: "id(test_bits) &= (uint8_t) ~16;"
+      - logger.log: {level: INFO, tag: carrier, format: "Bit test b3.6 back to its usual value."}
+  - platform: template
+    name: "Bit test b3.7 (usually 0, sent 1)"
+    icon: mdi:numeric-5-box-outline
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    turn_on_action:
+      - lambda: "id(test_bits) |= 32;"
+      - logger.log: {level: WARN, tag: carrier, format: "Bit test b3.7 (byte 3 bit 7) flipped in the next frames."}
+    turn_off_action:
+      - lambda: "id(test_bits) &= (uint8_t) ~32;"
+      - logger.log: {level: INFO, tag: carrier, format: "Bit test b3.7 back to its usual value."}
+
+# Called by learning-tools.yaml on every valid frame (from the remote, or our
+# own frames read back): the swing switch follows the received state.
+script:
+  - id: frame_received
+    then:
+      - lambda: "id(swing).publish_state(carrier84::get_swing(id(ac_state).data()));"

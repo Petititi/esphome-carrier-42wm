@@ -1,0 +1,281 @@
+# Carrier 42WM - learning tools (not compiled on its own).
+#
+# Included by carrier-42wm-learning.yaml only: raw IR state (ac_state), frame
+# decoding and capture log, transmit script (send_ac), capture note, counters.
+# Every valid frame runs the "frame_received" script defined by the includer.
+
+globals:
+  # Frame counters
+  - id: rx_count
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: rx_ko
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  - id: rx_other
+    type: uint32_t
+    restore_value: false
+    initial_value: "0"
+  # Current appliance state (11 CARRIER_AC84 bytes). Starts from a real frame
+  # (on, fan only, low speed, 30 degC) and is replaced by every frame received
+  # from the remote, so unknown bits always stay consistent.
+  - id: ac_state
+    type: std::array<uint8_t, 11>
+    restore_value: false
+    initial_value: "{0x0C, 0x12, 0x03, 0x33, 0x00, 0x12, 0x00, 0x12, 0x12, 0x14, 0x34}"
+  # Capture log kept in RAM (lost on reboot), replayed by "Dump capture log".
+  - id: cap_log
+    type: std::vector<std::string>
+    restore_value: false
+  - id: dump_idx
+    type: size_t
+    restore_value: false
+    initial_value: "SIZE_MAX"
+  # Bit tests: six bits never seen changing.
+  # bit 0 -> byte 2 bit 0   bit 2 -> byte 3 bit 4   bit 4 -> byte 3 bit 6
+  # bit 1 -> byte 2 bit 1   bit 3 -> byte 3 bit 5   bit 5 -> byte 3 bit 7
+  # When sending, these bits are forced to their usual value (byte 2 low nibble
+  # xx11, byte 3 high nibble 0011) unless selected here, in which case they flip.
+  - id: test_bits
+    type: uint8_t
+    restore_value: false
+    initial_value: "0"
+
+script:
+  # Builds the frame (clock + checksum) and sends it on the IR wire.
+  # Blocked while "IR transmit enabled" is off.
+  - id: send_ac
+    mode: queued
+    then:
+      - if:
+          condition:
+            switch.is_off: tx_enable
+          then:
+            - logger.log:
+                level: WARN
+                tag: carrier
+                format: "Transmit blocked: turn on \"IR transmit enabled\"."
+          else:
+            - lambda: |-
+                auto &s = id(ac_state);
+                auto now = id(sntp_time).now();
+                if (now.is_valid()) carrier84::set_clock(s.data(), now.hour, now.minute);
+                // Test bits: usual value, or flipped when selected. Forced on
+                // every send, so reading our own frames back cannot leave a
+                // test bit in the current state.
+                const uint8_t tb = id(test_bits);
+                s[2] = (uint8_t) ((s[2] & ~0x03) | (0x03 ^ (tb & 0x03)));
+                s[3] = (uint8_t) ((s[3] & 0x0F) | ((0x3 ^ ((tb >> 2) & 0x0F)) << 4));
+                carrier84::fix_checksum(s.data());
+                const std::string hex = carrier84::to_hex(s.data());
+                char bits[48] = "";
+                if (tb) {
+                  static const char *names[6] = {"b2.0", "b2.1", "b3.4", "b3.5", "b3.6", "b3.7"};
+                  strcpy(bits, " | test bits:");
+                  for (int i = 0; i < 6; i++)
+                    if (tb & (1 << i)) { strcat(bits, " "); strcat(bits, names[i]); }
+                }
+                char line[240];
+                snprintf(line, sizeof(line), "TX;%s;%s %d°C mode %s fan %s swing %s%s",
+                         hex.c_str(), carrier84::get_power(s.data()) ? "ON" : "OFF",
+                         carrier84::get_temp(s.data()),
+                         carrier84::mode_name(carrier84::get_mode(s.data())),
+                         carrier84::fan_name(carrier84::get_fan(s.data())),
+                         carrier84::get_swing(s.data()) ? "yes" : "no", bits);
+                ESP_LOGI("capture", "%s", line);
+                auto &j = id(cap_log);
+                if (j.size() >= 400) j.erase(j.begin());
+                j.push_back(line);
+                id(last_tx).publish_state(hex);
+            - remote_transmitter.transmit_raw:
+                code: !lambda "return carrier84::encode(id(ac_state).data());"
+
+  # Safety: transmit permission expires after 10 minutes.
+  - id: tx_auto_off
+    mode: restart
+    then:
+      - delay: 10min
+      - switch.turn_off: tx_enable
+
+switch:
+  - platform: template
+    id: tx_enable
+    name: "IR transmit enabled"
+    icon: mdi:remote
+    optimistic: true
+    restore_mode: ALWAYS_OFF
+    entity_category: config
+    on_turn_on:
+      - logger.log: {level: WARN, tag: carrier, format: "IR transmit ENABLED (10 min)."}
+      - script.execute: tx_auto_off
+    on_turn_off:
+      - logger.log: {level: INFO, tag: carrier, format: "IR transmit blocked."}
+      - script.stop: tx_auto_off
+
+text:
+  # What you are about to do on the remote; copied into the log.
+  - platform: template
+    id: capture_note
+    name: "Capture note"
+    mode: text
+    max_length: 60
+    optimistic: true
+    initial_value: ""
+
+text_sensor:
+  - platform: template
+    id: last_rx
+    name: "Last frame received"
+    entity_category: diagnostic
+    update_interval: never
+  # "#n | note | 11 bytes"
+  - platform: template
+    id: ir_log
+    name: "IR log"
+    icon: mdi:remote
+    update_interval: never
+  - platform: template
+    id: rx_fields
+    name: "Decoded fields"
+    icon: mdi:table
+    update_interval: never
+  - platform: template
+    id: last_unknown
+    name: "Unknown IR frame"
+    entity_category: diagnostic
+    update_interval: never
+  - platform: template
+    id: last_tx
+    name: "Last frame sent"
+    entity_category: diagnostic
+    update_interval: never
+
+sensor:
+  - platform: template
+    id: rx_frames
+    name: "IR frames received"
+    icon: mdi:counter
+    accuracy_decimals: 0
+    state_class: total_increasing
+    update_interval: never
+  - platform: template
+    id: rx_bad
+    name: "IR frames bad checksum"
+    icon: mdi:alert-circle-outline
+    accuracy_decimals: 0
+    entity_category: diagnostic
+    update_interval: never
+
+  - platform: wifi_signal
+    name: "Wi-Fi signal"
+    update_interval: 60s
+
+  - platform: uptime
+    name: "Uptime"
+
+
+# --- IR receiver (active low) -------------------------------------------------
+remote_receiver:
+  pin:
+    number: GPIO33       # through the 4050 buffer
+    inverted: true       # the IR receiver pulls the line low during a mark
+  dump: raw              # raw frames in the logs (useful for undecoded ones)
+  tolerance: 25%
+  filter: 50us
+  idle: 25ms
+  buffer_size: 10kb
+  # Decodes frames from the remote and our own frames (read back ~0.2 s later).
+  # Nothing is ever sent from here, so there is no loop. Each frame is numbered,
+  # tagged with the capture note, published and logged (CAPTURE;...).
+  on_raw:
+    then:
+      - lambda: |-
+          uint8_t s[carrier84::STATE_LEN];
+          if (!carrier84::decode(x, s)) {
+            // Not a Carrier frame: only report bursts long enough to be a
+            // frame (other remote, truncated frame), not noise.
+            if (x.size() >= 40) {
+              id(rx_other)++;
+              char b[64];
+              snprintf(b, sizeof(b), "#%u: %u durations, not decoded",
+                       (unsigned) id(rx_other), (unsigned) x.size());
+              id(last_unknown).publish_state(b);
+              ESP_LOGW("capture", "Not a Carrier frame: %u durations", (unsigned) x.size());
+            }
+            return;
+          }
+          const bool ok = carrier84::checksum_ok(s);
+          id(rx_count)++;
+          if (!ok) id(rx_ko)++;
+          const std::string hex = carrier84::to_hex(s);
+          const std::string note = id(capture_note).state;
+          // Decoded fields, raw values in parentheses. Stays under 255
+          // characters (Home Assistant state limit).
+          const uint8_t mode = carrier84::get_mode(s), fan = carrier84::get_fan(s);
+          char f[220];
+          snprintf(f, sizeof(f),
+                   "%s (b0=%X) %d°C | mode %s (%X) | fan %s (%X) | swing %s | "
+                   "timer %s %02X:%02X-%02X:%02X | clock %02X:%02X | b2 low=%X b3 high=%X",
+                   carrier84::get_power(s) ? "ON" : "OFF", s[0] & 0x0F, carrier84::get_temp(s),
+                   carrier84::mode_name(mode), mode, carrier84::fan_name(fan), fan,
+                   carrier84::get_swing(s) ? "yes" : "no",
+                   carrier84::get_timer(s) ? "yes" : "no",
+                   s[5], s[4], s[7], s[6], s[9], s[8], s[2] & 0x0F, s[3] >> 4);
+          char line[240];
+          snprintf(line, sizeof(line), "#%u | %s | %s%s", (unsigned) id(rx_count),
+                   note.empty() ? "-" : note.c_str(), hex.c_str(), ok ? "" : " | bad checksum");
+          // Easy to extract from the logs: grep CAPTURE
+          char cap[480];
+          snprintf(cap, sizeof(cap), "CAPTURE;%u;%s;%s;%s;%s", (unsigned) id(rx_count),
+                   note.c_str(), hex.c_str(), ok ? "OK" : "BAD", f);
+          ESP_LOGI("capture", "%s", cap);
+          auto &j = id(cap_log);
+          if (j.size() >= 400) j.erase(j.begin());   // ~40 kB at most
+          j.push_back(cap);
+          id(ir_log).publish_state(line);
+          id(rx_fields).publish_state(f);
+          id(rx_frames).publish_state(id(rx_count));
+          id(rx_bad).publish_state(id(rx_ko));
+          id(last_rx).publish_state(hex + (ok ? "" : " (bad checksum)"));
+          if (!ok) return;
+          std::copy(s, s + carrier84::STATE_LEN, id(ac_state).begin());
+          id(frame_received).execute();
+
+# Log replay: one line every 50 ms so the Wi-Fi log stream keeps up.
+interval:
+  - interval: 50ms
+    then:
+      - lambda: |-
+          auto &j = id(cap_log);
+          if (id(dump_idx) >= j.size()) return;
+          if (id(dump_idx) == 0)
+            ESP_LOGI("capture", "--- Log: %u capture(s) ---", (unsigned) j.size());
+          ESP_LOGI("capture", "%s", j[id(dump_idx)].c_str());
+          if (++id(dump_idx) >= j.size()) {
+            ESP_LOGI("capture", "--- End of log ---");
+            id(dump_idx) = SIZE_MAX;
+          }
+
+button:
+  - platform: template
+    name: "Dump capture log"
+    icon: mdi:text-box-search-outline
+    on_press:
+      - lambda: |-
+          if (id(cap_log).empty()) ESP_LOGI("capture", "Log is empty.");
+          else id(dump_idx) = 0;
+
+  - platform: template
+    name: "Reset IR counters"
+    entity_category: config
+    on_press:
+      - lambda: |-
+          id(rx_count) = 0; id(rx_ko) = 0; id(rx_other) = 0;
+          id(cap_log).clear();
+          id(rx_frames).publish_state(0);
+          id(rx_bad).publish_state(0);
+
+  - platform: restart
+    name: "Restart"
