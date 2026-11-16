@@ -193,8 +193,8 @@ This project was developed with [Claude Code](https://claude.com/claude-code)
 
 The firmware in this repository is an English translation of the one running
 in my appliance: entity names, comments and log messages changed, the logic
-did not. This translated version passes `esphome config` and the codec tests, but
-has not itself been flashed to the appliance yet. Treat it like any hobby project: read it before trusting it with your
+did not. This translated version compiles with ESPHome 2026.8.1 and passes the codec
+tests, but has not itself been flashed to the appliance yet. Treat it like any hobby project: read it before trusting it with your
 own appliance.
 
 ## Credits
